@@ -22,6 +22,7 @@ MODELS = [
 HISTORY_URL = "https://wingo-api-two.vercel.app/history"
 HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "10"))
 POLL_SECONDS = max(0.5, float(os.environ.get("POLL_SECONDS", "2")))
+MAX_STALE = max(1.0, float(os.environ.get("MAX_STALE", "5")))
 HISTORY_TIMEOUT = float(os.environ.get("HISTORY_TIMEOUT", "3"))
 MODEL_TIMEOUT = float(os.environ.get("MODEL_TIMEOUT", "5"))
 HISTORY_FILE = Path(os.environ.get("BS_HISTORY_FILE", str(Path(__file__).with_name("big_small_history.json"))))
@@ -39,6 +40,7 @@ _state: dict[str, Any] = {
 }
 _history: list[dict[str, Any]] = []
 _sse: set[asyncio.Queue] = set()
+_poll_lock = asyncio.Lock()
 
 
 def _load_history() -> None:
@@ -216,7 +218,7 @@ def _build_result(preds: list[Any], history: Any) -> dict[str, Any]:
     return result
 
 
-async def _poll_once() -> dict[str, Any]:
+async def _do_poll() -> dict[str, Any]:
     started = time.perf_counter()
     error = None
     history: Any = {}
@@ -266,6 +268,21 @@ async def _poll_once() -> dict[str, Any]:
     return result
 
 
+async def _poll_once() -> dict[str, Any]:
+    async with _poll_lock:
+        return await _do_poll()
+
+
+async def _ensure_fresh(wait: bool = False) -> dict[str, Any]:
+    stale = _state["result"] is None or (time.time() - _state["last_poll"]) > MAX_STALE
+    if wait or stale:
+        try:
+            await _poll_once()
+        except Exception as exc:
+            return {"status": "error", "size": "WAIT", "error": str(exc)[:200]}
+    return _state["result"] or {"status": "error", "size": "WAIT", "error": "no result yet"}
+
+
 async def _poller() -> None:
     while True:
         started = time.perf_counter()
@@ -301,18 +318,16 @@ async def root() -> dict[str, Any]:
 
 @app.get("/predict")
 async def predict(wait: bool = Query(False)) -> Any:
-    if wait or _state["result"] is None:
-        try:
-            await _poll_once()
-        except Exception as exc:
-            return JSONResponse(status_code=502, content={"error": "poll failed", "detail": str(exc)[:200]})
-    return _state["result"]
+    result = await _ensure_fresh(wait)
+    if result.get("status") == "error":
+        return JSONResponse(status_code=502, content=result)
+    return result
 
 
 @app.get("/size")
 async def only_size() -> PlainTextResponse:
-    result = _state["result"]
-    return PlainTextResponse(result["size"] if result else "WAIT")
+    result = await _ensure_fresh()
+    return PlainTextResponse(result.get("size", "WAIT"))
 
 
 @app.get("/health")
