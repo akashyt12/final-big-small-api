@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+big_small_history.json
+.vercel
